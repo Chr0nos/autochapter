@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from typing import Any
+from datetime import timedelta
 
 
 class Stream(BaseModel):
@@ -27,3 +28,9 @@ class VideoStream(Stream):
 
 class ProbeStats(BaseModel):
     streams: list[VideoStream | Stream]
+
+
+class FrameInfo(BaseModel):
+    filename: str
+    index: int
+    offset: float
