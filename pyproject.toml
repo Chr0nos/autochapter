@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "autochapter"
+version = "0.1.0"
+description = ""
+authors = ["Sebastien Nicolet <snicolet95@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+click = "^8.1.7"
+ffmpeg-python = "^0.2.0"
+pydantic = "^2.6.3"
+sentence-transformers = "^2.5.1"
+numpy = "^1.26.4"
+faiss-cpu = "^1.8.0"
+
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.2.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
