@@ -1,16 +1,13 @@
 import ffmpeg
 import click
 import os
-import io
 import yaml
 
 from annoy import AnnoyIndex
 import numpy as np
 from PIL import Image
-from pprint import pprint
-from datetime import timedelta, time, datetime
+from datetime import timedelta, datetime
 from typing import Generator, Iterable, Any
-from pydantic import RootModel
 from sentence_transformers import models, SentenceTransformer
 
 from autochapter.models import ProbeStats, VideoStream, FrameInfo
@@ -40,22 +37,27 @@ def generate_vectors(
     if stats.streams[0].codec_type == "video":
         video_stream_info: VideoStream = stats.streams[0]
         w, h = get_scaled_size(video_stream_info.width, video_stream_info.height, 224)
+        gpu_options = {
+            'hwaccel_device': '/dev/dri/renderD128',
+            "hwaccel": "nvdec",
+            # 'hwaccel_output_format': 'cuda',
+        } if gpu else {}
         raw_video, log = (
-            ffmpeg.input(filename, **({"hwaccel": "nvdec"} if gpu else {}))
+            ffmpeg.input(filename, **gpu_options)
             .filter("fps", fps=fps)
-            .filter("scale_npp", w, h)
+            .filter("scale", w, h)
+            # .filter('scale_npp', out_w=w, out_h=h)
             .output(
                 "pipe:",
                 format="rawvideo",
                 pix_fmt="rgb24",
-                hwaccel_output_format="cuda",
+                # r=fps,
             )
             .run(
                 capture_stdout=True,
                 quiet=quiet,
             )
         )
-        print(len(raw_video))
         frames: np.ndarray = np.frombuffer(raw_video, np.uint8).reshape([-1, h, w, 3])
         images = [Image.fromarray(frame) for frame in frames]
         vectors = img_model.encode(images)
@@ -117,14 +119,14 @@ def build_index(folder: str, fps: int, gpu: bool, verbose: bool) -> None:
 def dump_metadata(metadata: dict[int, Any], filename: str) -> None:
     obj = {}
     for frame_id, frame_info in metadata.items():
-        frame_filename = frame_info["filename"]
+        frame_filename = frame_info.filename
         if frame_filename not in obj:
             obj[frame_filename] = []
         obj[frame_filename].append(
             {
                 "id": frame_id,
-                "offset": frame_info["offset"],
-                "index": frame_info["index"],
+                "offset": frame_info.offset,
+                "index": frame_info.index,
             }
         )
     with open(filename, "w") as fp:
