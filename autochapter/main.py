@@ -43,21 +43,22 @@ def generate_vectors(
             {
                 "hwaccel_device": "/dev/dri/renderD128",
                 "hwaccel": "nvdec",
-                # 'hwaccel_output_format': 'cuda',
+                'hwaccel_output_format': 'nvenc',
             }
             if gpu
             else {}
         )
         raw_video, log = (
             ffmpeg.input(filename, **gpu_options)
-            .filter("fps", fps=fps)
+            # .filter("fps", fps=fps)
             .filter("scale", w, h)
             # .filter('scale_npp', out_w=w, out_h=h)
             .output(
                 "pipe:",
                 format="rawvideo",
                 pix_fmt="rgb24",
-                # r=fps,
+                r=fps,
+                preset='slow',
             )
             .run(
                 capture_stdout=True,
