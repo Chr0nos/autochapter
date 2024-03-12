@@ -10,7 +10,9 @@ from datetime import timedelta, datetime
 from typing import Generator, Iterable, Any
 from sentence_transformers import models, SentenceTransformer
 
-from autochapter.models import ProbeStats, VideoStream, FrameInfo
+from autochapter.models import ProbeStats, VideoStream, FrameInfo, Chapter
+
+MODEL_MAX_SIZE: int = 224
 
 
 def get_scaled_size(width: int, height: int, target_width: int) -> tuple[int, int]:
@@ -36,12 +38,16 @@ def generate_vectors(
     stats: ProbeStats = ProbeStats.model_validate(probe)
     if stats.streams[0].codec_type == "video":
         video_stream_info: VideoStream = stats.streams[0]
-        w, h = get_scaled_size(video_stream_info.width, video_stream_info.height, 224)
-        gpu_options = {
-            'hwaccel_device': '/dev/dri/renderD128',
-            "hwaccel": "nvdec",
-            # 'hwaccel_output_format': 'cuda',
-        } if gpu else {}
+        w, h = get_scaled_size(video_stream_info.width, video_stream_info.height, MODEL_MAX_SIZE)
+        gpu_options = (
+            {
+                "hwaccel_device": "/dev/dri/renderD128",
+                "hwaccel": "nvdec",
+                # 'hwaccel_output_format': 'cuda',
+            }
+            if gpu
+            else {}
+        )
         raw_video, log = (
             ffmpeg.input(filename, **gpu_options)
             .filter("fps", fps=fps)
@@ -78,9 +84,15 @@ def iter_over_vectors(
 
 @cli.command()
 @click.argument("folder", type=click.Path(exists=True, file_okay=False, dir_okay=True))
-@click.option("--fps", type=int, default=2, help="Frames per seconds to use into the model")
-@click.option("--gpu", type=bool, is_flag=True, help="Enable GPU for video decode (nvdec)")
-@click.option("--verbose", "-v", is_flag=True, default=False, help="Verbose FFMPEG output")
+@click.option(
+    "--fps", type=int, default=2, help="Frames per seconds to use into the model"
+)
+@click.option(
+    "--gpu", type=bool, is_flag=True, help="Enable GPU for video decode (nvdec)"
+)
+@click.option(
+    "--verbose", "-v", is_flag=True, default=False, help="Verbose FFMPEG output"
+)
 def build_index(folder: str, fps: int, gpu: bool, verbose: bool) -> None:
     # index = faiss.IndexFlatL2(512)
     index = AnnoyIndex(512, "angular")
@@ -98,7 +110,9 @@ def build_index(folder: str, fps: int, gpu: bool, verbose: bool) -> None:
         if not vectors:
             continue
         # put the vectors into the index
-        for frame_index, frame_time, frame_embedding in iter_over_vectors(filename, vectors, fps):
+        for frame_index, frame_time, frame_embedding in iter_over_vectors(
+            filename, vectors, fps
+        ):
             index.add_item(current_index, frame_embedding)
             metadata[current_index] = FrameInfo(
                 filename=filename,
@@ -148,13 +162,15 @@ def load_metadata(filename: str) -> dict[int, Any]:
 
 
 @cli.command()
-@click.option("--min-group-size", type=int, default=10)
+@click.option("--min-group-size", type=int, default=30)
 @click.option("--max-delta", type=float, default=10.0)
 @click.option("--occurency-min", type=int, default=20)
+@click.option("--distance-max", type=float, default=0.28)
 def search(
     min_group_size: int,
     max_delta: float,
     occurency_min: int,
+    distance_max: float,
 ):
     # TODO: refactor all this shit
     # so far it's just for testing...
@@ -175,10 +191,12 @@ def search(
         if filename not in files_mapping:
             files_mapping[filename] = []
 
-        vectors, distances = index.get_nns_by_item(frame_id, 200, include_distances=True)
+        vectors, distances = index.get_nns_by_item(
+            frame_id, 200, include_distances=True
+        )
         relevant_vectors_ids = []
         for vector_id, distance in zip(vectors, distances):
-            if distance > 0.22:
+            if distance > distance_max:
                 break
             # exclude vector from the same file
             if metadata[vector_id]["filename"] == filename:
@@ -193,7 +211,9 @@ def search(
 
     print("Making groups...")
     files_groups = {
-        filename: group_frames_ids(files_mapping[filename], metadata, max_delta, min_group_size)
+        filename: group_frames_ids(
+            files_mapping[filename], metadata, max_delta, min_group_size
+        )
         for filename in files_mapping.keys()
     }
     show_files_mapping(files_groups, metadata)
@@ -234,16 +254,68 @@ def group_frames_ids(
     return list(filter(lambda group: len(group) >= min_group_size, groups))
 
 
-def show_files_mapping(files_groups: dict[str, list[list[int]]], metadata: dict[int, Any]) -> None:
+def show_files_mapping(
+    files_groups: dict[str, list[list[int]]], metadata: dict[int, Any]
+) -> None:
     for filename, groups in files_groups.items():
         print(filename)
-        for group_index, group in enumerate(groups):
-            print(timedelta(seconds=metadata[group[-1]]["offset"] - metadata[group[0]]["offset"]))
-            for frame_id in group:
-                frame_offset = timedelta(seconds=metadata[frame_id]["offset"])
-                n = metadata[frame_id]["n"]
-                print(f"- {frame_id:3} [{n:2}] -> {frame_offset}")
-            print("---")
+        # for group in groups:
+        #     print(
+        #         timedelta(
+        #             seconds=metadata[group[-1]]["offset"] - metadata[group[0]]["offset"]
+        #         )
+        #     )
+        #     for frame_id in group:
+        #         frame_offset = timedelta(seconds=metadata[frame_id]["offset"])
+        #         n = metadata[frame_id]["n"]
+        #         print(f"- {frame_id:3} [{n:2}] -> {frame_offset}")
+        #     print("---")
+
+        print("".join([str(chapter) for chapter in groups_to_chapters(groups, metadata)]))
+
+
+def groups_to_chapters(
+    groups: dict[str, list[list[int]]], metadata: dict[int, Any]
+) -> list[Chapter]:
+    """
+    - https://blog.programster.org/add-chapters-to-mkv-file
+    """
+    chapters: list[Chapter] = []
+    i = 1
+
+    # opening is right at file's start
+    if metadata[groups[0][0]]["offset"] > 0:
+        chapters.append(Chapter(name="Intro", start=timedelta(seconds=0), index=i))
+        i += 1
+
+    chapters.append(
+        Chapter(
+            name="Opening",
+            start=timedelta(seconds=metadata[groups[0][0]]["offset"]),
+            index=i,
+        )
+    )
+    i += 1
+
+    chapters.append(
+        Chapter(
+            name='Episode',
+            start=timedelta(seconds=metadata[groups[0][-1]]['offset']),
+            index=i
+        )
+    )
+    i += 1
+
+    if len(groups) > 1:
+        chapters.append(
+            Chapter(
+                name="Ending",
+                start=timedelta(seconds=metadata[groups[-1][0]]["offset"]),
+                index=i,
+            ),
+        )
+
+    return chapters
 
 
 if __name__ == "__main__":

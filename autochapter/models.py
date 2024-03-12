@@ -34,3 +34,26 @@ class FrameInfo(BaseModel):
     filename: str
     index: int
     offset: float
+
+
+class Chapter(BaseModel):
+    index: int
+    name: str
+    start: timedelta
+
+    def __str__(self) -> str:
+        return f'CHAPTER{self.index:02}={self.time_format}\nCHAPTER{self.index:02}NAME={self.name}\n'
+
+    @property
+    def time_format(self) -> str:
+        hours = self.start.seconds // 3600
+        timeleft = timedelta(seconds=self.start.total_seconds() - hours * 3600)
+        mins = int(timeleft.total_seconds() // 60)
+        timeleft -= timedelta(minutes=mins)
+        seconds = int(timeleft.total_seconds() // 1)
+        miliseconds = int((timeleft.total_seconds() - seconds) * 1000)
+
+        ms_txt = str(miliseconds)
+        ms_len = len(ms_txt)
+        ms_txt = ms_txt + ('0' * max(3 - ms_len, 0))
+        return f'{hours:02}:{mins:02}:{seconds:02}.{ms_txt}'
