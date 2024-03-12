@@ -70,8 +70,9 @@ def iter_over_vectors(
 
 @cli.command()
 @click.argument("folder", type=click.Path(exists=True, file_okay=False, dir_okay=True))
-@click.option("--fps", type=int, default=2)
-def build_index(folder: str, fps: int) -> None:
+@click.option("--fps", type=int, default=2, help="Frames per seconds to use into the model")
+@click.option("--gpu", type=bool, is_flag=True, help="Enable GPU for video decode (nvdec)")
+def build_index(folder: str, fps: int, gpu: bool) -> None:
     # index = faiss.IndexFlatL2(512)
     index = AnnoyIndex(512, "angular")
     img_model = SentenceTransformer(modules=[models.CLIPModel()])
@@ -83,7 +84,7 @@ def build_index(folder: str, fps: int) -> None:
         filename = os.path.join(folder, basename)
         if basename.startswith(".") or not os.path.isfile(filename):
             continue
-        vectors = generate_vectors(filename, img_model, fps)
+        vectors = generate_vectors(filename, img_model, fps, gpu)
         if not vectors:
             continue
         # put the vectors into the index
