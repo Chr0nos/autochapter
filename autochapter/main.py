@@ -5,12 +5,11 @@ import io
 import yaml
 
 from annoy import AnnoyIndex
-import faiss
 import numpy as np
 from PIL import Image
 from pprint import pprint
 from datetime import timedelta, time
-from typing import Generator, Iterable
+from typing import Generator, Iterable, Any
 from pydantic import RootModel
 from sentence_transformers import models, SentenceTransformer
 
@@ -86,7 +85,7 @@ def identify(folder: str, fps: int) -> None:
         vectors = generate_vectors(filename, img_model, fps)
         if not vectors:
             continue
-        # put the vectors into the faiss index
+        # put the vectors into the index
         for frame_index, frame_time, frame_embedding in iter_over_vectors(filename, vectors, fps):
             index.add_item(current_index, frame_embedding)
             metadata[current_index] = FrameInfo(
@@ -107,7 +106,14 @@ def identify(folder: str, fps: int) -> None:
 
 
 @cli.command()
-def search():
+@click.option("--min-group-size", type=int, default=10)
+@click.option("--max-delta", type=float, default=10.0)
+@click.option("--occurency-min", type=int, default=20)
+def search(
+    min_group_size: int,
+    max_delta: float,
+    occurency_min: int,
+):
     # TODO: refactor all this shit
     # so far it's just for testing...
     with open("/tmp/index.yml") as fp:
@@ -117,25 +123,87 @@ def search():
 
     print("Searching")
 
-    for gid, frame in metadata.items():
-        vectors, distances = index.get_nns_by_item(gid, 200, include_distances=True)
+    files_mapping: dict[str, list[int]] = {}
 
+    for frame_id, frame in metadata.items():
+        filename = frame["filename"]
+        offset = frame["offset"]
+        if filename not in files_mapping:
+            files_mapping[filename] = []
+
+        vectors, distances = index.get_nns_by_item(frame_id, 200, include_distances=True)
         relevant_vectors_ids = []
         for vector_id, distance in zip(vectors, distances):
-            if distance > 0.2:
-                continue
+            if distance > 0.22:
+                break
             # exclude vector from the same file
-            if metadata[vector_id]["filename"] == metadata[gid]["filename"]:
+            if metadata[vector_id]["filename"] == filename:
                 continue
             relevant_vectors_ids.append(vector_id)
 
-        revelancy = len(relevant_vectors_ids)
-        if revelancy > 20:
+        # how many time a similar frame happens in others files
+        occurences = len(relevant_vectors_ids)
+        if occurences >= occurency_min:
+            metadata[frame_id]["n"] = occurences
+            files_mapping[filename].append(frame_id)
+
+    print("Making groups...")
+    files_groups = {
+        filename: group_frames_ids(files_mapping[filename], metadata, max_delta, min_group_size)
+        for filename in files_mapping.keys()
+    }
+    show_files_mapping(files_groups, metadata)
+
+
+def group_frames_ids(
+    frames_ids: list[int],
+    metadata: dict[int, Any],
+    max_delta: float,
+    min_group_size: int,
+) -> list[list[int]]:
+    """groups ids by their placement in time
+    allowing a `max_delta` (in seconds) between frames
+    (to handle missing frames from previous filtering)
+    remove any group that is smaller than `min_group_size`
+    """
+    last_id: int | None = None
+    last_frame_info = None
+    groups: list[list[int]] = []
+
+    for frame_id in frames_ids:
+        frame_info = metadata[frame_id]
+        if not last_id:
+            groups.append([frame_id])
+        elif not last_frame_info:
+            groups.append([frame_id])
+        else:
+            delta = frame_info["offset"] - last_frame_info["offset"]
+            if delta <= max_delta:
+                groups[-1].append(frame_id)
+            else:
+                groups.append([frame_id])
+                last_frame_info = None
+
+        last_id = frame_id
+        last_frame_info = frame_info
+
+    return list(filter(lambda group: len(group) >= min_group_size, groups))
+
+
+def show_files_mapping(files_groups: dict[str, list[list[int]]], metadata: dict[int, Any]) -> None:
+    groups_names = {0: "Opening", 1: "Ending"}
+    for filename, groups in files_groups.items():
+        print(filename)
+        for group_index, group in enumerate(groups):
             print(
-                metadata[gid]["filename"],
-                revelancy,
-                timedelta(seconds=frame["offset"]),
+                timedelta(seconds=metadata[group[-1]]["offset"] - metadata[group[0]]["offset"]),
+                groups_names.get(group_index, "Other"),
             )
+            for frame_id in group:
+                frame_offset = timedelta(seconds=metadata[frame_id]["offset"])
+                n = metadata[frame_id]["n"]
+                print(f"- {frame_id:3} [{n:2}] -> {frame_offset}")
+            print("---")
 
 
 if __name__ == "__main__":
