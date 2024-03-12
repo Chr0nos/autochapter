@@ -1,3 +1,11 @@
+# What is it ?
+This is a tool to automaticaly figure out what are the opening / ending in shows
+It uses video embddings with `CLIP` models to find similarities between frames
+
+It's slow AF (even with a GPU) so don't try to use it for anything else than research
+
+TODO: use sound signature instead of video...
+
 # WSL steps
 ```shell
 wsl --install -d Ubuntu
