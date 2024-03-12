@@ -40,7 +40,7 @@ def generate_vectors(
         video_stream_info: VideoStream = stats.streams[0]
         w, h = get_scaled_size(video_stream_info.width, video_stream_info.height, 224)
         raw_video, log = (
-            ffmpeg.input(filename, **({"hwaccel": "nvdev"} if gpu else {}))
+            ffmpeg.input(filename, **({"hwaccel": "nvdec"} if gpu else {}))
             .filter("fps", fps=fps)
             .filter("scale", w, h)
             .output("pipe:", format="rawvideo", pix_fmt="rgb24")
