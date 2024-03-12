@@ -30,6 +30,7 @@ def generate_vectors(
     filename: str,
     img_model: SentenceTransformer,
     fps: int,
+    gpu: bool = False,
 ) -> list[list[float]] | None:
     probe: dict[str, Any] = ffmpeg.probe(filename)
     # stream = ffmpeg.input(filename)
@@ -39,7 +40,7 @@ def generate_vectors(
         video_stream_info: VideoStream = stats.streams[0]
         w, h = get_scaled_size(video_stream_info.width, video_stream_info.height, 224)
         raw_video, log = (
-            ffmpeg.input(filename)
+            ffmpeg.input(filename, **({"hwaccel": "nvdev"} if gpu else {}))
             .filter("fps", fps=fps)
             .filter("scale", w, h)
             .output("pipe:", format="rawvideo", pix_fmt="rgb24")
@@ -70,7 +71,7 @@ def iter_over_vectors(
 @cli.command()
 @click.argument("folder", type=click.Path(exists=True, file_okay=False, dir_okay=True))
 @click.option("--fps", type=int, default=2)
-def identify(folder: str, fps: int) -> None:
+def build_index(folder: str, fps: int) -> None:
     # index = faiss.IndexFlatL2(512)
     index = AnnoyIndex(512, "angular")
     img_model = SentenceTransformer(modules=[models.CLIPModel()])
@@ -101,8 +102,38 @@ def identify(folder: str, fps: int) -> None:
     print("Saving index")
     index.save("/tmp/index.ann")
 
-    with open("/tmp/index.yml", "w") as fp:
-        fp.write(yaml.safe_dump({k: v.model_dump() for k, v in metadata.items()}))
+    dump_metadata(metadata, "/tmp/index.yml")
+
+
+def dump_metadata(metadata: dict[int, Any], filename: str) -> None:
+    obj = {}
+    for frame_id, frame_info in metadata.items():
+        frame_filename = frame_info["filename"]
+        if frame_filename not in obj:
+            obj[frame_filename] = []
+        obj[frame_filename].append(
+            {
+                "id": frame_id,
+                "offset": frame_info["offset"],
+                "index": frame_info["index"],
+            }
+        )
+    with open(filename, "w") as fp:
+        fp.write(yaml.safe_dump(obj))
+
+
+def load_metadata(filename: str) -> dict[int, Any]:
+    metadata = {}
+    with open(filename, "r") as fp:
+        obj = yaml.safe_load(fp.read())
+    for filename, values in obj.items():
+        for frame in values:
+            metadata[frame["id"]] = {
+                "filename": filename,
+                "offset": frame["offset"],
+                "index": frame["index"],
+            }
+    return metadata
 
 
 @cli.command()
@@ -116,8 +147,10 @@ def search(
 ):
     # TODO: refactor all this shit
     # so far it's just for testing...
-    with open("/tmp/index.yml") as fp:
-        metadata = yaml.safe_load(fp)
+    print("Loading metadata...")
+    metadata = load_metadata("/tmp/index.yml")
+
+    print("Loading index...")
     index = AnnoyIndex(512, "angular")
     index.load("/tmp/index.ann")
 
@@ -191,14 +224,10 @@ def group_frames_ids(
 
 
 def show_files_mapping(files_groups: dict[str, list[list[int]]], metadata: dict[int, Any]) -> None:
-    groups_names = {0: "Opening", 1: "Ending"}
     for filename, groups in files_groups.items():
         print(filename)
         for group_index, group in enumerate(groups):
-            print(
-                timedelta(seconds=metadata[group[-1]]["offset"] - metadata[group[0]]["offset"]),
-                groups_names.get(group_index, "Other"),
-            )
+            print(timedelta(seconds=metadata[group[-1]]["offset"] - metadata[group[0]]["offset"]))
             for frame_id in group:
                 frame_offset = timedelta(seconds=metadata[frame_id]["offset"])
                 n = metadata[frame_id]["n"]
