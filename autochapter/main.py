@@ -8,7 +8,7 @@ from annoy import AnnoyIndex
 import numpy as np
 from PIL import Image
 from pprint import pprint
-from datetime import timedelta, time
+from datetime import timedelta, time, datetime
 from typing import Generator, Iterable, Any
 from pydantic import RootModel
 from sentence_transformers import models, SentenceTransformer
@@ -31,6 +31,7 @@ def generate_vectors(
     img_model: SentenceTransformer,
     fps: int,
     gpu: bool = False,
+    quiet: bool = True,
 ) -> list[list[float]] | None:
     probe: dict[str, Any] = ffmpeg.probe(filename)
     # stream = ffmpeg.input(filename)
@@ -42,11 +43,16 @@ def generate_vectors(
         raw_video, log = (
             ffmpeg.input(filename, **({"hwaccel": "nvdec"} if gpu else {}))
             .filter("fps", fps=fps)
-            .filter("scale", w, h)
-            .output("pipe:", format="rawvideo", pix_fmt="rgb24")
+            .filter("scale_npp", w, h)
+            .output(
+                "pipe:",
+                format="rawvideo",
+                pix_fmt="rgb24",
+                hwaccel_output_format="cuda",
+            )
             .run(
                 capture_stdout=True,
-                # quiet=True,
+                quiet=quiet,
             )
         )
         print(len(raw_video))
@@ -72,7 +78,8 @@ def iter_over_vectors(
 @click.argument("folder", type=click.Path(exists=True, file_okay=False, dir_okay=True))
 @click.option("--fps", type=int, default=2, help="Frames per seconds to use into the model")
 @click.option("--gpu", type=bool, is_flag=True, help="Enable GPU for video decode (nvdec)")
-def build_index(folder: str, fps: int, gpu: bool) -> None:
+@click.option("--verbose", "-v", is_flag=True, default=False, help="Verbose FFMPEG output")
+def build_index(folder: str, fps: int, gpu: bool, verbose: bool) -> None:
     # index = faiss.IndexFlatL2(512)
     index = AnnoyIndex(512, "angular")
     img_model = SentenceTransformer(modules=[models.CLIPModel()])
@@ -84,7 +91,8 @@ def build_index(folder: str, fps: int, gpu: bool) -> None:
         filename = os.path.join(folder, basename)
         if basename.startswith(".") or not os.path.isfile(filename):
             continue
-        vectors = generate_vectors(filename, img_model, fps, gpu)
+        print(f"Vectorizing {datetime.utcnow()} {filename} ...")
+        vectors = generate_vectors(filename, img_model, fps, gpu, verbose is False)
         if not vectors:
             continue
         # put the vectors into the index
