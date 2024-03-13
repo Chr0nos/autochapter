@@ -2,6 +2,7 @@ import ffmpeg
 import click
 import os
 import yaml
+from sys import exit
 
 from annoy import AnnoyIndex
 import numpy as np
@@ -58,7 +59,6 @@ def generate_vectors(
                 format="rawvideo",
                 pix_fmt="rgb24",
                 r=fps,
-                preset='slow',
             )
             .run(
                 capture_stdout=True,
@@ -72,7 +72,6 @@ def generate_vectors(
 
 
 def iter_over_vectors(
-    filename: str,
     vectors: Iterable[list[float]],
     fps: int,
 ) -> Generator[tuple[int, timedelta, list[float]], None, None]:
@@ -95,6 +94,8 @@ def iter_over_vectors(
     "--verbose", "-v", is_flag=True, default=False, help="Verbose FFMPEG output"
 )
 def build_index(folder: str, fps: int, gpu: bool, verbose: bool) -> None:
+    """Build an index at the given folder
+    """
     # index = faiss.IndexFlatL2(512)
     index = AnnoyIndex(512, "angular")
     img_model = SentenceTransformer(modules=[models.CLIPModel()])
@@ -111,9 +112,7 @@ def build_index(folder: str, fps: int, gpu: bool, verbose: bool) -> None:
         if not vectors:
             continue
         # put the vectors into the index
-        for frame_index, frame_time, frame_embedding in iter_over_vectors(
-            filename, vectors, fps
-        ):
+        for frame_index, frame_time, frame_embedding in iter_over_vectors(vectors, fps):
             index.add_item(current_index, frame_embedding)
             metadata[current_index] = FrameInfo(
                 filename=filename,
@@ -163,16 +162,31 @@ def load_metadata(filename: str) -> dict[int, Any]:
 
 
 @cli.command()
-@click.option("--min-group-size", type=int, default=30)
-@click.option("--max-delta", type=float, default=10.0)
-@click.option("--occurency-min", type=int, default=20)
-@click.option("--distance-max", type=float, default=0.28)
+def list_index() -> None:
+    """List what files are currently in the index
+    """
+    try:
+        with open('/tmp/index.yml') as fp:
+            yml_content = yaml.safe_load(fp)
+        print(*yml_content.keys(), sep='\n')
+    except FileNotFoundError:
+        print('No index build before')
+        exit(1)
+
+
+@cli.command()
+@click.option("--min-group-size", type=int, default=30, help='How many frames must be in the group')
+@click.option("--max-delta", type=float, default=10.0, help='How much time can separate two frames')
+@click.option("--occurency-min", type=int, default=20, help='How many times a frame has to have neightboors')
+@click.option("--distance-max", type=float, default=0.28, help='Maxiumum distance between a frame and it\'s neigtboors')
 def search(
     min_group_size: int,
     max_delta: float,
     occurency_min: int,
     distance_max: float,
 ):
+    """Search for chapters into indexed files
+    """
     # TODO: refactor all this shit
     # so far it's just for testing...
     print("Loading metadata...")
@@ -188,7 +202,6 @@ def search(
 
     for frame_id, frame in metadata.items():
         filename = frame["filename"]
-        offset = frame["offset"]
         if filename not in files_mapping:
             files_mapping[filename] = []
 
@@ -281,6 +294,8 @@ def groups_to_chapters(
     """
     - https://blog.programster.org/add-chapters-to-mkv-file
     """
+    if not groups:
+        return []
     chapters: list[Chapter] = []
     i = 1
 

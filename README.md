@@ -23,4 +23,9 @@ PKG_CONFIG_PATH=/usr/local/lib/pkgconfig/ ./configure --enable-nonfree --enable-
 make -j
 sudo make install
 ```
+
+# Usefull links
 - https://docs.nvidia.com/video-technologies/video-codec-sdk/12.0/ffmpeg-with-nvidia-gpu/index.html
+- https://huggingface.co/docs/transformers/v4.19.2/en/model_doc/clip#transformers.CLIPFeatureExtractor
+- https://trac.ffmpeg.org/wiki/HWAccelIntro
+- https://blog.programster.org/add-chapters-to-mkv-file

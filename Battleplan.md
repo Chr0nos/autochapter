@@ -2,7 +2,7 @@
 - [x] recompress video into raw frames
 - [x] resize video in 244p at 2 fps
 - [x] use a CLIP model to generate frame embedding
-- [ ] save the embedding into an index
-- [ ] iterate over the index search for groups of similarities
+- [x] save the embedding into an index
+- [x] iterate over the index search for groups of similarities
 - [ ] export the chapters.txt
 - [ ] merge chaperts.txt using mkvmerge into the file
