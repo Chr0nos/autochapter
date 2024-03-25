@@ -1,0 +1,15 @@
+version: '3.9'
+services:
+  postgres:
+    build:
+      context: ./pgvector
+      dockerfile: Dockerfile
+    ports:
+    - 5432:5432
+    environment:
+      - POSTGRES_DB=autochapter
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=ui2gf2ugf287gf2
+      - PGDATA=/var/lib/postgresql/data
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data

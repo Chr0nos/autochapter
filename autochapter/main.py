@@ -10,10 +10,69 @@ from PIL import Image
 from datetime import timedelta, datetime
 from typing import Generator, Iterable, Any
 from sentence_transformers import models, SentenceTransformer
+from functools import wraps
+from autochapter.schemas import ProbeStats, VideoStream, FrameInfo, Chapter
+from autochapter.models import File, Frame
+from autochapter.config import cfg
+import asyncio
+from tortoise import Tortoise, connection
+# from tortoise_vector.expression import CosineSimilarity
+from asyncio_pool import AioPool
+from tortoise.queryset import QuerySet
 
-from autochapter.models import ProbeStats, VideoStream, FrameInfo, Chapter
+from tortoise.expressions import RawSQL
+
+
+class CosineSimilarity(RawSQL):
+    def __init__(self, field: str, vector: list[float], vector_size: int = 1536):
+        super().__init__(f"{field} <-> '{vector}'")
+
 
 MODEL_MAX_SIZE: int = 224
+TORTOISE_CONFIG = {
+    "connections": {
+        "default": {
+            "engine": "tortoise.backends.asyncpg",
+            "credentials": {
+                "database": cfg.postgres.db,
+                "host": cfg.postgres.host,
+                "port": cfg.postgres.port,
+                "user": cfg.postgres.username,
+                "password": cfg.postgres.password,
+            }
+        },
+    },
+    "apps": {
+        "main": {
+            "models": [
+                "aerich.models",
+                "autochapter.models",
+            ],
+            "default_connection": "default",
+        },
+    },
+    "timezone": "UTC",
+}
+
+
+def sync_to_async(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(func(*args, **kwargs))
+
+    return wrapper
+
+
+def with_database(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            await Tortoise.init(config=TORTOISE_CONFIG)
+            return await func(*args, **kwargs)
+        finally:
+            await Tortoise.close_connections()
+
+    return wrapper
 
 
 def get_scaled_size(width: int, height: int, target_width: int) -> tuple[int, int]:
@@ -44,7 +103,7 @@ def generate_vectors(
             {
                 "hwaccel_device": "/dev/dri/renderD128",
                 "hwaccel": "nvdec",
-                'hwaccel_output_format': 'nvenc',
+                "hwaccel_output_format": "nvenc",
             }
             if gpu
             else {}
@@ -59,8 +118,7 @@ def generate_vectors(
                 format="rawvideo",
                 pix_fmt="rgb24",
                 r=fps,
-            )
-            .run(
+            ).run(
                 capture_stdout=True,
                 quiet=quiet,
             )
@@ -74,223 +132,191 @@ def generate_vectors(
 def iter_over_vectors(
     vectors: Iterable[list[float]],
     fps: int,
-) -> Generator[tuple[int, timedelta, list[float]], None, None]:
+) -> Generator[tuple[timedelta, list[float]], None, None]:
     frame_duraration = timedelta(seconds=1 / fps)
     current_frame_time = timedelta(seconds=0)
-    for index, vector in enumerate(vectors):
-        yield (index, current_frame_time, vector)
+    for vector in vectors:
+        yield (current_frame_time, vector)
         current_frame_time += frame_duraration
 
 
 @cli.command()
 @click.argument("folder", type=click.Path(exists=True, file_okay=False, dir_okay=True))
-@click.option(
-    "--fps", type=int, default=2, help="Frames per seconds to use into the model"
-)
-@click.option(
-    "--gpu", type=bool, is_flag=True, help="Enable GPU for video decode (nvdec)"
-)
-@click.option(
-    "--verbose", "-v", is_flag=True, default=False, help="Verbose FFMPEG output"
-)
-def build_index(folder: str, fps: int, gpu: bool, verbose: bool) -> None:
-    """Build an index at the given folder
-    """
-    # index = faiss.IndexFlatL2(512)
-    index = AnnoyIndex(512, "angular")
+@click.option("--fps", type=int, default=2, help="Frames per seconds to use into the model")
+@click.option("--gpu", type=bool, is_flag=True, help="Enable GPU for video decode (nvdec)")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="Verbose FFMPEG output")
+@sync_to_async
+@with_database
+async def build_index(folder: str, fps: int, gpu: bool, verbose: bool) -> None:
+    """Build an index at the given folder"""
     img_model = SentenceTransformer(modules=[models.CLIPModel()])
-
-    current_index = 0
-    metadata = {}
 
     for basename in sorted(os.listdir(folder)):
         filename = os.path.join(folder, basename)
         if basename.startswith(".") or not os.path.isfile(filename):
             continue
         print(f"Vectorizing {datetime.utcnow()} {filename} ...")
+        file = await File.create(filename=filename, fps=fps)
         vectors = generate_vectors(filename, img_model, fps, gpu, verbose is False)
         if not vectors:
             continue
-        # put the vectors into the index
-        for frame_index, frame_time, frame_embedding in iter_over_vectors(vectors, fps):
-            index.add_item(current_index, frame_embedding)
-            metadata[current_index] = FrameInfo(
-                filename=filename,
-                index=frame_index,
-                offset=frame_time.total_seconds(),
-            )
-            current_index += 1
-        # break
 
-    print("Building index...")
-    index.build(10)
-    print("Saving index")
-    index.save("/tmp/index.ann")
-
-    dump_metadata(metadata, "/tmp/index.yml")
-
-
-def dump_metadata(metadata: dict[int, Any], filename: str) -> None:
-    obj = {}
-    for frame_id, frame_info in metadata.items():
-        frame_filename = frame_info.filename
-        if frame_filename not in obj:
-            obj[frame_filename] = []
-        obj[frame_filename].append(
-            {
-                "id": frame_id,
-                "offset": frame_info.offset,
-                "index": frame_info.index,
-            }
-        )
-    with open(filename, "w") as fp:
-        fp.write(yaml.safe_dump(obj))
-
-
-def load_metadata(filename: str) -> dict[int, Any]:
-    metadata = {}
-    with open(filename, "r") as fp:
-        obj = yaml.safe_load(fp.read())
-    for filename, values in obj.items():
-        for frame in values:
-            metadata[frame["id"]] = {
-                "filename": filename,
-                "offset": frame["offset"],
-                "index": frame["index"],
-            }
-    return metadata
+        for frame_time, frame_embedding in iter_over_vectors(vectors, fps):
+            await Frame.create(file=file, offset=frame_time, embedding=frame_embedding)
 
 
 @cli.command()
-def list_index() -> None:
-    """List what files are currently in the index
-    """
-    try:
-        with open('/tmp/index.yml') as fp:
-            yml_content = yaml.safe_load(fp)
-        print(*yml_content.keys(), sep='\n')
-    except FileNotFoundError:
-        print('No index build before')
-        exit(1)
+@sync_to_async
+@with_database
+async def list_index() -> None:
+    """List what files are currently in the index"""
+    async for file in File.all():
+        frames_count = await file.frames.all().count()
+        print(f'File: {file.filename}: {frames_count} frame(s). (fps: {file.fps})')
+    print("Total frames: ", await Frame.all().count())
 
 
 @cli.command()
-@click.option("--min-group-size", type=int, default=30, help='How many frames must be in the group')
-@click.option("--max-delta", type=float, default=10.0, help='How much time can separate two frames')
-@click.option("--occurency-min", type=int, default=20, help='How many times a frame has to have neightboors')
-@click.option("--distance-max", type=float, default=0.28, help='Maxiumum distance between a frame and it\'s neigtboors')
-def search(
+@click.option(
+    "--min-group-size",
+    type=int,
+    default=60,
+    help="How many frames must be in the group",
+)
+@click.option(
+    "--max-delta",
+    type=float,
+    default=10.0,
+    help="How much time can separate two frames",
+)
+@click.option(
+    "--occurency-min",
+    type=int,
+    default=15,
+    help="How many times a frame has to have neightboors",
+)
+@click.option(
+    "--distance-max",
+    type=float,
+    default=0.26,
+    help="Maxiumum distance between a frame and it's neigtboors",
+)
+@click.option(
+    '--file',
+    type=click.Path(dir_okay=False, file_okay=True, exists=True),
+    required=False,
+    default=None
+)
+@sync_to_async
+@with_database
+async def search(
     min_group_size: int,
     max_delta: float,
     occurency_min: int,
     distance_max: float,
+    file: str | None = None,
 ):
-    """Search for chapters into indexed files
-    """
-    # TODO: refactor all this shit
-    # so far it's just for testing...
-    print("Loading metadata...")
-    metadata = load_metadata("/tmp/index.yml")
+    """Search for chapters into indexed files"""
 
-    print("Loading index...")
-    index = AnnoyIndex(512, "angular")
-    index.load("/tmp/index.ann")
+    print('Building index')
+    folder = None
+    index = await build_annoy_index(folder)
+    print('Searching...')
+    files_qs = File.all()
+    if folder:
+        files_qs = files_qs.filter(filename__startswith=folder)
+    if file:
+        files_qs = files_qs.filter(filename=file)
+    async for file in files_qs:
+        print(f'{file}:')
+        relevant_frames = await get_relevant_frames(file, index, distance_max, occurency_min)
+        groups = group_frames(relevant_frames, max_delta, min_group_size)
+        # chapters = groups_to_chapters(groups)
+        show_groups(groups)
+        # show_chapters(chapters)
 
-    print("Searching")
 
-    files_mapping: dict[str, list[int]] = {}
+async def get_relevant_frames(
+    file: File,
+    index: AnnoyIndex,
+    distance_max: float,
+    occurences_min: int,
+) -> list[Frame]:
+    relevant_frames: list[Frame] = []
+    current_file_frames_ids: list[int] = await file.frames.all().values_list('id', flat=True)
+    # iterate over all frames from the current file.
+    async for frame in file.frames.all().only('id', 'offset', 'file_id'):
+        vectors, distances = index.get_nns_by_item(frame.id, 200, include_distances=True)
+        valid_neightboors: list[int] = [
+            vector
+            for vector, distance in zip(vectors, distances)
+            if distance <= distance_max and vector not in current_file_frames_ids
+        ]
+        neightboors_count: int = len(valid_neightboors)
+        if neightboors_count >= occurences_min:
+            relevant_frames.append(frame)
 
-    for frame_id, frame in metadata.items():
-        filename = frame["filename"]
-        if filename not in files_mapping:
-            files_mapping[filename] = []
+    return relevant_frames
 
-        vectors, distances = index.get_nns_by_item(
-            frame_id, 200, include_distances=True
+
+async def get_relevant_frames_pg(file: File, distance_max: float, occurences_min: int) -> list[Frame]:
+    relevant_frames: list[Frame] = []
+    folder: str = str(os.path.dirname(file.filename))
+    async for frame in file.frames.all():
+        valid_neightboors_count_qs = (
+            Frame
+            .all()
+            .exclude(file_id=file.id)
+            .annotate(distance=CosineSimilarity("embedding", frame.embedding, 512))
+            .filter(distance__lte=distance_max)
+            .count()
         )
-        relevant_vectors_ids = []
-        for vector_id, distance in zip(vectors, distances):
-            if distance > distance_max:
-                break
-            # exclude vector from the same file
-            if metadata[vector_id]["filename"] == filename:
-                continue
-            relevant_vectors_ids.append(vector_id)
-
-        # how many time a similar frame happens in others files
-        occurences = len(relevant_vectors_ids)
-        if occurences >= occurency_min:
-            metadata[frame_id]["n"] = occurences
-            files_mapping[filename].append(frame_id)
-
-    print("Making groups...")
-    files_groups = {
-        filename: group_frames_ids(
-            files_mapping[filename], metadata, max_delta, min_group_size
-        )
-        for filename in files_mapping.keys()
-    }
-    show_files_mapping(files_groups, metadata)
+        print(await connection.connections.get('default').execute_query(f"EXPLAIN ANALYZE {valid_neightboors_count_qs.as_query()}"))
+        valid_neightboors_count: int = await valid_neightboors_count_qs
+        print(frame.offset, valid_neightboors_count)
+        if valid_neightboors_count >= occurences_min:
+            relevant_frames.append(frame)
+    return relevant_frames
 
 
-def group_frames_ids(
-    frames_ids: list[int],
-    metadata: dict[int, Any],
+
+async def build_annoy_index(folder: str | None = None) -> AnnoyIndex:
+    index = AnnoyIndex(512, 'angular')
+    frames = Frame.all()
+    if folder:
+        frames = frames.filter(file__filename__startswith=folder)
+    async for frame in frames.only("id", "embedding"):
+        index.add_item(frame.id, frame.embedding)
+    index.build(10)
+    return index
+
+
+def group_frames(
+    frames: list[Frame],
     max_delta: float,
-    min_group_size: int,
-) -> list[list[int]]:
-    """groups ids by their placement in time
-    allowing a `max_delta` (in seconds) between frames
-    (to handle missing frames from previous filtering)
-    remove any group that is smaller than `min_group_size`
-    """
-    last_id: int | None = None
-    last_frame_info = None
-    groups: list[list[int]] = []
-
-    for frame_id in frames_ids:
-        frame_info = metadata[frame_id]
-        if not last_id:
-            groups.append([frame_id])
-        elif not last_frame_info:
-            groups.append([frame_id])
+    min_group_size: int
+) -> list[list[Frame]]:
+    last_frame: Frame | None = None
+    groups: list[list[Frame]] = []
+    for frame in frames:
+        # we create a new group if there is no new frame
+        if not last_frame:
+            groups.append([frame])
+            last_frame = frame
         else:
-            delta = frame_info["offset"] - last_frame_info["offset"]
-            if delta <= max_delta:
-                groups[-1].append(frame_id)
+            delta: timedelta = frame.offset - last_frame.offset
+            # append the frame to the last group if still in the good delta
+            if delta <= timedelta(seconds=max_delta):
+                groups[-1].append(frame)
+                last_frame = frame
+            # otherwise we create a new group with the frame in it.
             else:
-                groups.append([frame_id])
-                last_frame_info = None
-
-        last_id = frame_id
-        last_frame_info = frame_info
-
+                groups.append([frame])
+                last_frame = None
     return list(filter(lambda group: len(group) >= min_group_size, groups))
 
 
-def show_files_mapping(
-    files_groups: dict[str, list[list[int]]], metadata: dict[int, Any]
-) -> None:
-    for filename, groups in files_groups.items():
-        print(filename)
-        # for group in groups:
-        #     print(
-        #         timedelta(
-        #             seconds=metadata[group[-1]]["offset"] - metadata[group[0]]["offset"]
-        #         )
-        #     )
-        #     for frame_id in group:
-        #         frame_offset = timedelta(seconds=metadata[frame_id]["offset"])
-        #         n = metadata[frame_id]["n"]
-        #         print(f"- {frame_id:3} [{n:2}] -> {frame_offset}")
-        #     print("---")
-
-        print("".join([str(chapter) for chapter in groups_to_chapters(groups, metadata)]))
-
-
-def groups_to_chapters(
-    groups: dict[str, list[list[int]]], metadata: dict[int, Any]
-) -> list[Chapter]:
+def groups_to_chapters(groups: list[list[Frame]]) -> list[Chapter]:
     """
     - https://blog.programster.org/add-chapters-to-mkv-file
     """
@@ -300,38 +326,35 @@ def groups_to_chapters(
     i = 1
 
     # opening is right at file's start
-    if metadata[groups[0][0]]["offset"] > 0:
+    if groups[0][0].offset.total_seconds() > 0:
         chapters.append(Chapter(name="Intro", start=timedelta(seconds=0), index=i))
         i += 1
 
     chapters.append(
         Chapter(
             name="Opening",
-            start=timedelta(seconds=metadata[groups[0][0]]["offset"]),
+            start=groups[0][0].offset,
             index=i,
         )
     )
     i += 1
 
-    chapters.append(
-        Chapter(
-            name='Episode',
-            start=timedelta(seconds=metadata[groups[0][-1]]['offset']),
-            index=i
-        )
-    )
+    chapters.append(Chapter(name="Episode", start=groups[0][-1].offset, index=i))
     i += 1
 
     if len(groups) > 1:
-        chapters.append(
-            Chapter(
-                name="Ending",
-                start=timedelta(seconds=metadata[groups[-1][0]]["offset"]),
-                index=i,
-            ),
-        )
+        chapters.append(Chapter(name="Ending", start=groups[-1][0].offset ,index=i))
 
     return chapters
+
+
+def show_chapters(chapters: Iterable[Chapter]) -> None:
+    print("".join([str(chapter) for chapter in chapters]))
+
+
+def show_groups(groups: list[list[Frame]]) -> None:
+    for group_id, group in enumerate(groups):
+        print(f'Group {group_id}: {group[0].offset} - {group[-1].offset} ({len(group)})')
 
 
 if __name__ == "__main__":

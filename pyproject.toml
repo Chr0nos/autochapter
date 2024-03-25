@@ -14,11 +14,21 @@ sentence-transformers = "^2.5.1"
 numpy = "^1.26.4"
 faiss-cpu = "^1.8.0"
 annoy = "^1.17.3"
+tortoise-orm = {extras = ["asyncpg"], version = "^0.20.0"}
+aerich = "^0.7.2"
+pydantic-config = "^0.3.0"
+tortoise-vector = "^0.1.1"
+asyncio-pool = "^0.6.0"
 
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.2.0"
 
+
+[tool.aerich]
+tortoise_orm = "autochapter.main.TORTOISE_CONFIG"
+location = "./migrations"
+src_folder = "./."
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
