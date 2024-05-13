@@ -22,7 +22,7 @@ cd ffmpeg
 PKG_CONFIG_PATH=/usr/local/lib/pkgconfig/ ./configure --enable-nonfree --enable-cuda-nvcc --enable-libnpp --extra-cflags=-I/usr/local/cuda/include --extra-ldflags=-L/usr/local/cuda/lib64 --disable-static --enable-shared --enable-cuvid --enable-nvenc
 make -j
 sudo make install
-``
+```
 
 # How does it works
 There is 2 parts: the indexing and the search
