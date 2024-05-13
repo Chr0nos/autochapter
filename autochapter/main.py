@@ -11,20 +11,20 @@ from datetime import timedelta, datetime
 from typing import Generator, Iterable, Any
 from sentence_transformers import models, SentenceTransformer
 from functools import wraps
-from autochapter.schemas import ProbeStats, VideoStream, FrameInfo, Chapter
+from autochapter.schemas import ProbeStats, VideoStream, Chapter
 from autochapter.models import File, Frame
 from autochapter.config import cfg
 import asyncio
 from tortoise import Tortoise, connection
 # from tortoise_vector.expression import CosineSimilarity
-from asyncio_pool import AioPool
 from tortoise.queryset import QuerySet
+from tortoise.transactions import in_transaction
 
 from tortoise.expressions import RawSQL
 
 
 class CosineSimilarity(RawSQL):
-    def __init__(self, field: str, vector: list[float], vector_size: int = 1536):
+    def __init__(self, field: str, vector: list[float]):
         super().__init__(f"{field} <-> '{vector}'")
 
 
@@ -145,24 +145,29 @@ def iter_over_vectors(
 @click.option("--fps", type=int, default=2, help="Frames per seconds to use into the model")
 @click.option("--gpu", type=bool, is_flag=True, help="Enable GPU for video decode (nvdec)")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="Verbose FFMPEG output")
+@click.option("--force", '-f', is_flag=True, default=False, help='Force a replacement if already present')
 @sync_to_async
 @with_database
-async def build_index(folder: str, fps: int, gpu: bool, verbose: bool) -> None:
+async def build_index(folder: str, fps: int, gpu: bool, verbose: bool, force: bool) -> None:
     """Build an index at the given folder"""
     img_model = SentenceTransformer(modules=[models.CLIPModel()])
 
     for basename in sorted(os.listdir(folder)):
         filename = os.path.join(folder, basename)
+        if not force and await File.filter(filename=filename, fps=fps).exists():
+            continue
         if basename.startswith(".") or not os.path.isfile(filename):
             continue
         print(f"Vectorizing {datetime.utcnow()} {filename} ...")
-        file = await File.create(filename=filename, fps=fps)
         vectors = generate_vectors(filename, img_model, fps, gpu, verbose is False)
         if not vectors:
             continue
 
-        for frame_time, frame_embedding in iter_over_vectors(vectors, fps):
-            await Frame.create(file=file, offset=frame_time, embedding=frame_embedding)
+        async with in_transaction():
+            await File.filter(filename=filename).delete()
+            file = await File.create(filename=filename, fps=fps)
+            for frame_time, frame_embedding in iter_over_vectors(vectors, fps):
+                await Frame.create(file=file, offset=frame_time, embedding=frame_embedding)
 
 
 @cli.command()
@@ -207,6 +212,7 @@ async def list_index() -> None:
     required=False,
     default=None
 )
+@click.option('--folder', type=click.Path(file_okay=False, dir_okay=True), default=None)
 @sync_to_async
 @with_database
 async def search(
@@ -215,11 +221,12 @@ async def search(
     occurency_min: int,
     distance_max: float,
     file: str | None = None,
+    folder: str | None = None
 ):
     """Search for chapters into indexed files"""
-
+    assert not (folder and file), 'Cannot specify both'
     print('Building index')
-    folder = None
+    folder = folder if not file else str(os.path.dirname(file))
     index = await build_annoy_index(folder)
     print('Searching...')
     files_qs = File.all()
@@ -267,7 +274,7 @@ async def get_relevant_frames_pg(file: File, distance_max: float, occurences_min
             Frame
             .all()
             .exclude(file_id=file.id)
-            .annotate(distance=CosineSimilarity("embedding", frame.embedding, 512))
+            .annotate(distance=CosineSimilarity("embedding", frame.embedding))
             .filter(distance__lte=distance_max)
             .count()
         )
