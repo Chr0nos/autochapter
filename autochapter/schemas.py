@@ -30,12 +30,6 @@ class ProbeStats(BaseModel):
     streams: list[VideoStream | Stream]
 
 
-class FrameInfo(BaseModel):
-    filename: str
-    index: int
-    offset: float
-
-
 class Chapter(BaseModel):
     index: int
     name: str
